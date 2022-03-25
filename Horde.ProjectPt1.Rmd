@@ -1,0 +1,954 @@
+---
+title: "Disaster Relief Project: Part 1"
+author: "Lauren Horde"
+date: "`r format(Sys.Date(), '%b %d, %Y')`"
+output:
+  html_document:
+    number_sections: true    
+    toc: true
+    toc_float: true
+    theme: spacelab
+    highlight: default    
+# You can make the format personal - this will get you started:  
+# https://bookdown.org/yihui/rmarkdown/html-document.html#appearance_and_style    
+---
+
+<!--- Below are global settings for knitr. You can override any of them by adding the changes to individual chunks --->
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(
+  error=TRUE,          # Keep compiling upon error
+  collapse=FALSE,      # collapse by default
+  echo=TRUE,           # echo code by default
+  comment = "#>",      # change comment character
+  fig.width = 5.5,     # set figure width
+  fig.align = "center",# set figure position
+  out.width = "49%",   # set width of displayed images
+  warning=TRUE,        # show R warnings
+  message=TRUE         # show R messages
+)
+```
+
+<!--- Change font sizes (or other css modifications) --->
+<style>
+h1.title {
+  font-size: 2.2em; /* Title font size */
+}
+h1 {
+  font-size: 2em;   /* Header 1 font size */
+}
+h2 {
+  font-size: 1.5em;
+}
+h3 { 
+  font-size: 1.2em;
+}
+pre {
+  font-size: 0.8em;  /* Code and R output font size */
+}
+</style>
+
+
+
+**SYS 6018 | Spring 2022 | University of Virginia **
+
+*******************************************
+
+# Introduction 
+
+The goal of this project is to evaluate the performance of 4 supervised learning models to determine which is most adept to assist in humanitarian aid efforts following an environmental crisis in Haiti. Due to the destruction caused by a 7.0 magnitude earthquake in Haiti, an unknown number of residents were displaced and left without communications, shelter, food, and water. It was noted that displaced persons were building temporary shelters using blue tarps. The successful identification of blue tarps could be used to locate these displaced persons. Given the crunch for time in this disaster, a modeling approach can be taken to cut down on the time spent visually inspecting geo-spatial imagery for blue tarps. The model charged with this task must be equipped to find the maximum number of displaced persons, so the following models have been created using 10-fold cross-validation and assessed using several performance measures to correctly identify blue tarp locations.
+
+# Training Data
+```{r load-packages, warning=FALSE, message=FALSE}
+# Load Required Packages
+library(tidyverse)
+library(readr)
+library(broom)
+library(glmnet)
+library(yardstick)
+library(FNN)
+library(caret)
+library(tidymodels)
+library(pROC)
+
+#load data
+x <- read_csv("HaitiTraining.csv")
+summary(x)
+
+#change class to factor, isolate blue tarp hits and misses
+x$Class <- as.factor(x$Class)
+
+x$BlueTarp <- ifelse(x$Class=="Blue Tarp", "Hit", "Miss")
+x$BlueTarp <- as.factor(x$BlueTarp)
+```
+
+## Exploratory Data Analysis {.tabset}
+
+### Classification Breakdown
+```{r}
+plot(x$Class, main="Classification Breakdown", las=1)
+table(x$Class, x$BlueTarp)
+
+plot(x$BlueTarp, main="Number of Blue Tarp Hits and Misses", las=1)
+table(x$BlueTarp)
+```
+
+### Red Values
+```{r}
+plot_cols = c("Hit"="blue", "Miss"="red")
+red.value <- ggplot(x, aes(Red, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+red.value
+```
+
+### Green Values
+```{r}
+plot_cols = c("Hit"="blue", "Miss"="red")
+green.value <- ggplot(x, aes(Green, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+green.value
+```
+
+### Blue Values
+```{r}
+plot_cols = c("Hit"="blue", "Miss"="red")
+blue.value <- ggplot(x, aes(Blue, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+blue.value
+```
+# {-}
+
+# Model Training
+```{r}
+sample.size <- floor(0.60*nrow(x))
+set.seed(2022)
+train.data <- sample(seq_len(nrow(x)), size=sample.size)
+
+train <- x[train.data,]
+test <- x[-train.data,]
+```
+
+
+## Set-up 
+Training controls apply to the CARET package for building models. By using method="cv", this function implements cross-validation at a manually set number (number=10).
+```{r}
+train.control <- trainControl(method="cv",
+                              number=10,
+                              savePredictions=TRUE,
+                              classProbs = TRUE)
+```
+
+
+## Logistic Regression {.tabset}
+
+### Model Setup
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+set.seed(2023)
+haiti.log <- train(BlueTarp ~ Red + Green + Blue,
+                   data=train, method ="glm",
+                   family="binomial",
+                   trControl=train.control)
+
+log.test.pred <- predict(haiti.log, newdata=test)
+haiti.prob <- predict(haiti.log, newdata=test, type="prob")[,"Hit"]
+```
+
+### Threshold Selection
+The threshold 0.25 was chosen based on the highest accuracy when testing threshold increments of 0.05 between 0 and 1.
+
+```{r, warning=FALSE, message=FALSE}
+log.threshold <- thresholder(haiti.log,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+log.threshold.plot <- ggplot(log.threshold, aes(x=prob_threshold, y = Accuracy)) +
+  geom_point()
+log.threshold.plot
+
+log.pred.thres = as.factor(ifelse(predict(haiti.log,
+                                          newdata=test,
+                                          type="prob")$Hit>0.25, "Hit", "Miss"))
+```
+# {-}
+
+## KNN {.tabset}
+
+### Model Setup
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+set.seed(2024)
+haiti.knn <- train(BlueTarp ~ Red + Green + Blue, data=train, method ="knn",
+                 trControl=train.control,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+
+knn.test.pred <- predict(haiti.knn, newdata=test)
+knn.prob <- predict(haiti.knn, newdata=test, type="prob")[,"Hit"]
+```
+
+
+### Tuning Parameter $k$
+The CARET package tested the model against 23 values of K ranging from 1 to 23. The K value, K=11, was chosen as the optimal tuning parameter based on maximized accuracy.
+
+```{r}
+haiti.knn$bestTune
+neighbors <- plot(haiti.knn, main="Neighbors and Accuracy")
+neighbors
+```
+
+
+### Threshold Selection
+The threshold 0.5 was chosen based on the highest accuracy when testing threshold increments of 0.05 between 0 and 1. This result is the same as the default threshold implemented by the CARET model.
+
+```{r, warning=FALSE, message=FALSE}
+knn.threshold <- thresholder(haiti.knn,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+knn.threshold.plot <- ggplot(knn.threshold, aes(x=prob_threshold, y = Accuracy)) +
+  geom_point()
+knn.threshold.plot
+
+knn.pred.thres = as.factor(ifelse(predict(haiti.knn,
+                                    newdata=test,
+                                    type="prob")$Hit>0.5, "Hit", "Miss"))
+```
+# {-}
+
+
+## Penalized Logistic Regression (ElasticNet) {.tabset}
+### Model Setup
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+set.seed(2025)
+
+#generate grid of lambda and alpha values
+alpha.lambda = expand.grid(alpha=seq(0, 1, length=10),
+                           lambda= seq(0, 100, length=100))
+
+#generates 1000 models testing alpha and lambda values (10 x 100)
+enet.haiti <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="glmnet",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid = alpha.lambda,
+                    tuneLength = 10
+                    )
+
+enet.test.pred <- predict(enet.haiti, newdata=test)
+enet.prob <- predict(enet.haiti, newdata=test, type="prob")[,"Hit"]
+
+```
+
+### Tuning Parameters for Penalized Logistic Regression
+The CARET package lets you test out different alpha and lambda values by tuning the grid. I tested 10 alpha values between 0 and 1 and 100 lambda values between 1 and 100. This generated 1000 models testing each combination (10 x 100). The best alpha and lambda values were selected based on which model produced the highest accuracy.
+
+Lambda = 0
+Alpha = 1
+
+```{r}
+enet.haiti$bestTune$lambda
+enet.haiti$bestTune$alpha
+```
+
+
+### Threshold Selection
+The threshold 0.05 was chosen based on the highest accuracy when testing threshold increments of 0.5 between 0 and 1.
+
+```{r, warning=FALSE, message=FALSE}
+enet.threshold <- thresholder(enet.haiti,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+enet.threshold.plot <- ggplot(enet.threshold, aes(x=prob_threshold, y=Accuracy)) +
+  geom_point()
+enet.threshold.plot
+
+enet.pred.thres = as.factor(ifelse(predict(enet.haiti,
+                                          newdata=test,
+                                          type="prob")$Hit>0.05, "Hit", "Miss"))
+```
+# {-}
+
+## Support Vector Machines (SVM) {.tabset}
+### Model Setup
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+set.seed(2026)
+svm.haiti7 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=data.frame(C = seq(0.1, 1, length=10)))
+
+svm.test.pred <- predict(svm.haiti7, newdata=test)
+svm.prob <- predict(svm.haiti7, newdata=test, type="prob")[,"Hit"]
+```
+
+### Tuning Parameters
+Ten values of C from 0.1 to 1 were manually set to be tested using the CARET package. If C is not manually set, CARET will apply a default C of 1. The values 0.1 to 1 were chosen to be tested based on prior modeling attempts (see appendix code). Values between 0.1 and 100 were pilot tested, with the best fit being 0.1 and 1. With this result, I decided to test values between 0.1 and 1 to further refine the model.
+
+The optimal C using linear kernel methods was determined to be 0.6 based on the highest accuracy value.
+
+```{r}
+svm.haiti7$bestTune
+cost.selection <- plot(svm.haiti7, main="Cost Value and Accuracy")
+cost.selection
+```
+
+
+### Threshold Selection
+The threshold 0.25 was chosen based on the highest accuracy when testing threshold increments of 0.5 between 0 and 1.
+
+```{r, warning=FALSE, message=FALSE}
+svm.threshold <- thresholder(svm.haiti7,
+                              threshold = seq(0, 1, by = 0.05),
+                              final = TRUE)
+
+svm.threshold.plot <- ggplot(svm.threshold, aes(x=prob_threshold, y=Accuracy)) +
+  geom_point()
+svm.threshold.plot
+
+
+svm.pred.thres = as.factor(ifelse(predict(svm.haiti7,
+                                           newdata=test,
+                                           type="prob")$Hit>0.25, "Hit", "Miss"))
+```
+# {-}
+
+# Results (Cross-Validation) {.tabset}
+The best models were chosen using the CARET package according to the highest accuracy value. Accuracy is calculated as:
+\begin{align*}
+Accuracy = \frac{TP + FN}{TP + TN + FP + FN}
+\end{align*}
+
+## Logistic
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+log.performance.t <- confusionMatrix(test$BlueTarp, log.pred.thres, positive="Hit")
+log.overall.stats.t <- log.performance.t$overall
+log.confusion.matrix.t <- log.performance.t$table
+
+log.test.pred.plot <- plot(log.pred.thres, main="Logistic Classification Results")
+log.test.pred.plot
+log.confusion.matrix.t
+
+
+log.accuracy.t <- log.performance.t$overall[1] #accuracy = 0.9957702
+log.tpr.t <- log.performance.t$byClass[1] #TPR aka sensitivity = 0.9384422
+log.fpr.t <- log.performance.t$byClass[2] #FPR aka specificity = 0.9976327
+log.precision.t <- log.performance.t$byClass[5] #precision = 0.9279503
+
+log.pred.thres1 <- as.numeric(log.pred.thres)
+log.roc.t <- roc(test$BlueTarp, log.pred.thres1, ordered=TRUE)
+log.auc.t <- auc(log.roc.t) #AUROC=0.963
+```
+
+## KNN
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+knn.performance.t <- confusionMatrix(test$BlueTarp, knn.pred.thres, positive="Hit")
+knn.overall.stats.t <- knn.performance.t$overall
+knn.confusion.matrix.t <- knn.performance.t$table
+
+knn.test.pred.plot <- plot(knn.pred.thres, main="KNN Classification Results")
+knn.test.pred.plot
+knn.confusion.matrix.t
+
+knn.accuracy.t <- knn.performance.t$overall[1] #accuracy = 0.9971143
+knn.tpr.t <- knn.performance.t$byClass[1] #TPR aka sensitivity = 0.9474328
+knn.fpr.t <- knn.performance.t$byClass[2] #FPR aka specificity = 0.9987745
+knn.precision.t <- knn.performance.t$byClass[5] #precision = 0.9627329
+
+knn.pred.thres1 <- as.numeric(knn.pred.thres)
+knn.roc.t <- roc(test$BlueTarp, knn.pred.thres1, ordered=TRUE)
+knn.auc.t <- auc(knn.roc.t) #AUROC=0.9805
+
+```
+
+## Elastic Net
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+enet.performance.t <- confusionMatrix(test$BlueTarp, enet.pred.thres, positive="Hit")
+enet.overall.stats.t <- enet.performance.t$overall
+enet.confusion.matrix.t <- enet.performance.t$table
+
+enet.pred.thres = as.factor(ifelse(predict(enet.haiti,
+                                          newdata=test,
+                                          type="prob")$Hit>0.05, "Hit", "Miss"))
+enet.test.pred.plot <- plot(enet.pred.thres, main="Elastic Net Classification Results")
+enet.test.pred.plot
+enet.confusion.matrix.t
+
+enet.accuracy.t <- enet.performance.t$overall[1] #accuracy = 0.9859272
+enet.tpr.t <- enet.performance.t$byClass[1] #TPR aka sensitivity = 0.6992014
+enet.fpr.t <- enet.performance.t$byClass[2] #FPR aka specificity = 0.9992966
+enet.precision.t <- enet.performance.t$byClass[5] #precision = 0.978882
+
+enet.pred.thres1 <- as.numeric(enet.pred.thres)
+enet.roc.t <- roc(test$BlueTarp, enet.pred.thres1, ordered=TRUE)
+enet.auc.t <- auc(enet.roc.t) #AUROC=0.9825
+```
+
+## SVM
+```{r, warning=FALSE, message=FALSE, fig.show='hide'}
+svm.performance.t <- confusionMatrix(test$BlueTarp, svm.pred.thres, positive="Hit")
+svm.overall.stats.t <- svm.performance.t$overall
+svm.confusion.matrix.t <- svm.performance.t$table
+
+svm.pred.thres = as.factor(ifelse(predict(svm.haiti7,
+                                           newdata=test,
+                                           type="prob")$Hit>0.25, "Hit", "Miss"))
+svm.test.pred.plot <- plot(svm.pred.thres, main="Linear SVM Classification Results")
+svm.test.pred.plot
+svm.confusion.matrix.t
+
+svm.accuracy.t <- svm.performance.t$overall[1] #accuracy = 0.9958098
+svm.tpr.t <- svm.performance.t$byClass[1] #TPR aka sensitivity = 0.9440915
+svm.fpr.t <- svm.performance.t$byClass[2] #FPR aka specificity = 0.9974704
+svm.precision.t <- svm.performance.t$byClass[5] #precision = 0.9229814
+
+svm.pred.thres1 <- as.numeric(svm.pred.thres)
+svm.roc.t <- roc(test$BlueTarp, svm.pred.thres1, ordered=TRUE)
+svm.auc.t <- auc(svm.roc.t) #AUROC=0.9606
+```
+# {-}
+
+## Performance Table
+```{r}
+Model <- c("Logistic Regression", "KNN", "Elastic Net", "SVM")
+Tuning <- c("N/A", "K=11", "Alpha=1, Lambda=0", "C=0.6")
+AUROC <- c(log.auc.t, knn.auc.t, enet.auc.t, svm.auc.t)
+Threshold <- c("0.25", "0.5", "0.05", "0.25")
+Accuracy <- c(log.accuracy.t, knn.accuracy.t, enet.accuracy.t, svm.accuracy.t)
+TPR <- c(log.tpr.t, knn.tpr.t, enet.tpr.t, svm.tpr.t)
+FPR <- c(log.fpr.t, knn.fpr.t, enet.fpr.t, svm.fpr.t)
+Precision <- c(log.precision.t, knn.precision.t, enet.precision.t, svm.precision.t)
+
+Parameters <- data.frame(Model, Tuning, AUROC, Threshold, Accuracy, TPR, FPR, Precision)
+tablefinal <- knitr::kable(Parameters, "pipe", align=c("l", "c", "c", "c", "c", "c", "c", "c"))
+tablefinal
+```
+
+
+
+## ROC Curves {.tabset}
+
+### Logistic
+```{r}
+log.roc.plot.t <- plot(log.roc.t, col="red", main="Logistic ROC Curve using Threshold 0.25")
+```
+
+### KNN
+```{r}
+knn.roc.plot.t <- plot(knn.roc.t, col="red", main="KNN ROC Curve using Threshold 0.5")
+```
+
+
+### Elastic Net
+```{r}
+enet.roc.plot.t <- plot(enet.roc.t, col="red", main="Elastic Net ROC Curve using Threshold 0.05")
+```
+
+### SVM
+```{r}
+svm.roc.plot.t <- plot(svm.roc.t, col="red", main="SVM ROC Curve using Threshold 0.25")
+```
+# {-}
+
+
+# Conclusions {.tabset}
+
+## Conclusion \#1 
+Conclusion 1
+
+## Conclusion \#2
+Conclusion 2
+
+## Conclusion \#3
+Conclusion 3
+
+# {-}
+
+# References
+1. https://www.tutorialspoint.com/r/r_factors.htm \  
+
+2. https://stackoverflow.com/questions/9251326/convert-data-frame-column-format-from-character-to-factor \  
+
+3. https://www.geeksforgeeks.org/dummy-variables-in-r-programming/ \  
+
+4. https://r4ds.had.co.nz/exploratory-data-analysis.html \  
+
+5. https://stackoverflow.com/questions/17200114/how-to-split-data-into-training-testing-sets-using-sample-function \  
+
+6. https://cran.r-project.org/web/packages/caret/caret.pdf \  
+
+7. https://remiller1450.github.io/s230f19/caret2.html \  
+
+8. http://rstudio-pubs-static.s3.amazonaws.com/274284_cfbabe09cd2c4e2984cd965daf7cb2c5.html \  
+
+9. https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html \  
+
+10. https://stackoverflow.com/questions/30366143/how-to-compute-roc-and-auc-under-roc-after-training-using-caret-in-r \  
+
+11. https://topepo.github.io/caret/measuring-performance.html \  
+
+12. https://rdrr.io/cran/caret/man/recall.html \  
+
+13. https://dataaspirant.com/knn-implementation-r-using-caret-package/ \  
+
+14. https://daviddalpiaz.github.io/r4sl/the-caret-package.html \  
+
+15. https://rdrr.io/cran/caret/man/recall.html \  
+
+16. https://stackoverflow.com/questions/62437321/set-cutoff-threshold-when-predicting-in-r \  
+
+17. https://daviddalpiaz.github.io/r4sl/elastic-net.html#classification-1 \  
+
+18. http://www.sthda.com/english/articles/37-model-selection-essentials-in-r/153-penalized-regression-essentials-ridge-lasso-elastic-net/ \  
+
+19. https://rpubs.com/uky994/593668 \  
+
+20. https://stackoverflow.com/questions/12809633/parameter-c-in-svm-standard-to-find-best-parameter \  
+
+# Appendix
+<details>
+<summary>Code</summary>
+```
+# Training Data / EDA----------
+#Load data, explore data, etc. 
+library(tidyverse)
+library(readr)
+library(broom)
+library(glmnet)
+library(yardstick)
+library(FNN)
+library(caret)
+library(tidymodels)
+library(pROC)
+
+#load data
+x <- read_csv("HaitiTraining.csv")
+summary(x)
+
+#change class to factor, isolate blue tarp hits and misses
+x$Class <- as.factor(x$Class)
+
+x$BlueTarp <- ifelse(x$Class=="Blue Tarp", "Hit", "Miss")
+x$BlueTarp <- as.factor(x$BlueTarp)
+
+#exploratory data analysis
+plot(x$Class, main="Classification Breakdown", las=1)
+plot(x$BlueTarp, main="Number of Blue Tarp Hits and Misses", las=1)
+
+table(x$Class, x$BlueTarp)
+table(x$BlueTarp)
+
+plot_cols = c("Hit"="blue", "Miss"="red")
+
+red.value <- ggplot(train, aes(Red, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+
+green.value <- ggplot(train, aes(Green, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+
+blue.value <- ggplot(train, aes(Blue, fill=BlueTarp)) + 
+  geom_density(alpha=.75) + 
+  facet_wrap(~BlueTarp, labeller=label_both) + 
+  scale_fill_manual(values=plot_cols)
+
+# Model Training------
+#separate into train/test datasets
+sample.size <- floor(0.60*nrow(x))
+set.seed(2022)
+train.data <- sample(seq_len(nrow(x)), size=sample.size)
+
+train <- x[train.data,]
+test <- x[-train.data,]
+
+# Set-up-------
+#set up caret training control and model
+train.control <- trainControl(method="cv",
+                              number=10,
+                              savePredictions=TRUE,
+                              classProbs = TRUE)
+
+# Logistic Regression--------
+set.seed(2023)
+haiti.log <- train(BlueTarp ~ Red + Green + Blue,
+                   data=train, method ="glm",
+                   family="binomial",
+                   trControl=train.control)
+
+#assessing model outcomes
+haiti.log$results
+#99.5% accuracy
+
+#applying test set
+log.test.pred <- predict(haiti.log, newdata=test)
+log.test.pred.plot <- plot(log.test.pred)
+
+#creating confusion matrix
+log.performance <- confusionMatrix(log.test.pred, test$BlueTarp)
+log.overall.stats <- log.performance$overall
+log.confusion.matrix <- log.performance$table
+
+#roc setup
+haiti.prob <- predict(haiti.log, newdata=test, type="prob")[,"Hit"]
+log.roc <- pROC::roc(test$BlueTarp, haiti.prob)
+log.roc.plot <- plot(log.roc, col="red", main="Logistic Regression ROC Curve")
+
+#assessing performance
+log.accuracy <- log.performance$overall[1] #accuracy = 0.9953354
+log.tpr <- log.performance$byClass[1] #TPR aka sensitivity = 0.8919255
+log.fpr <- log.performance$byClass[2] #FPR aka specificity = 0.9987343
+log.precision <- log.performance$byClass[5] #precision = 0.9586115
+log.auc <- auc(log.roc) #AUROC = 0.9988
+
+#finding best threshold to maximize accuracy (0.25 found to be best)
+log.threshold <- thresholder(haiti.log,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+log.threshold.plot <- ggplot(log.threshold, aes(x=prob_threshold, y = Accuracy)) +
+  geom_point()
+
+log.pred.thres = as.factor(ifelse(predict(haiti.log,
+                                          newdata=test,
+                                          type="prob")$Hit>0.25, "Hit", "Miss"))
+
+#threshold confusion matrix
+log.performance.t <- confusionMatrix(test$BlueTarp, log.pred.thres, positive="Hit")
+log.overall.stats.t <- log.performance.t$overall
+log.confusion.matrix.t <- log.performance.t$table
+
+#roc setup for threshold
+log.pred.thres1 <- as.numeric(log.pred.thres)
+log.roc.t <- roc(test$BlueTarp, log.pred.thres1, ordered=TRUE)
+log.roc.plot.t <- plot(log.roc.t, col="red", main="Logistic ROC Curve using Threshold 0.25")
+
+#assessing performance of threshold=0.4
+log.accuracy.t <- log.performance.t$overall[1] #accuracy = 0.9957702
+log.tpr.t <- log.performance.t$byClass[1] #TPR aka sensitivity = 0.9384422
+log.fpr.t <- log.performance.t$byClass[2] #FPR aka specificity = 0.9976327
+log.precision.t <- log.performance.t$byClass[5] #precision = 0.9279503
+log.auc.t <- auc(log.roc.t) #AUROC=0.963
+
+# KNN------
+#setup model
+set.seed(2024)
+haiti.knn <- train(BlueTarp ~ Red + Green + Blue, data=train, method ="knn",
+                 trControl=train.control,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+
+#assessing model outcomes
+haiti.knn$results
+haiti.knn$finalModel
+#99.71% accuracy using k=11
+
+#applying test set
+knn.test.pred <- predict(haiti.knn, newdata=test)
+knn.test.pred.plot <- plot(knn.test.pred)
+
+#creating confusion matrix
+knn.performance <- confusionMatrix(knn.test.pred, test$BlueTarp)
+knn.overall.stats <- knn.performance$overall
+knn.confusion.matrix <- knn.performance$table
+
+#roc setup
+knn.prob <- predict(haiti.knn, newdata=test, type="prob")[,"Hit"]
+knn.roc <- roc(test$BlueTarp, knn.prob, ordered=TRUE)
+knn.roc.plot <- plot(knn.roc, col="red", main="KNN ROC Curve")
+
+#assessing performance
+knn.accuracy <- knn.performance$overall[1] #accuracy = 0.9971538
+knn.tpr <- knn.performance$byClass[1] #TPR aka sensitivity = 0.9639752
+knn.fpr <- knn.performance$byClass[2] #FPR aka specificity = 0.9982443
+knn.precision <- knn.performance$byClass[5] #precision = 0.9474969
+knn.auc <- auc(knn.roc) #AUROC = 0.9997
+
+#finding best threshold to maximize accuracy (0.5 found to be best)
+knn.threshold <- thresholder(haiti.knn,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+knn.threshold.plot <- ggplot(knn.threshold, aes(x=prob_threshold, y = Accuracy)) +
+  geom_point()
+
+knn.pred.thres = as.factor(ifelse(predict(haiti.knn,
+                                    newdata=test,
+                                    type="prob")$Hit>0.5, "Hit", "Miss"))
+
+#threshold confusion matrix
+knn.performance.t <- confusionMatrix(test$BlueTarp, knn.pred.thres, positive="Hit")
+knn.overall.stats.t <- knn.performance.t$overall
+knn.confusion.matrix.t <- knn.performance.t$table
+
+#roc setup for threshold
+knn.pred.thres1 <- as.numeric(knn.pred.thres)
+knn.roc.t <- roc(test$BlueTarp, knn.pred.thres1, ordered=TRUE)
+knn.roc.plot.t <- plot(knn.roc.t, col="red", main="KNN ROC Curve using Threshold 0.4")
+
+#assessing performance of threshold=0.5
+knn.accuracy.t <- knn.performance.t$overall[1] #accuracy = 0.9971143
+knn.tpr.t <- knn.performance.t$byClass[1] #TPR aka sensitivity = 0.9474328
+knn.fpr.t <- knn.performance.t$byClass[2] #FPR aka specificity = 0.9987745
+knn.precision.t <- knn.performance.t$byClass[5] #precision = 0.9627329
+knn.auc.t <- auc(knn.roc.t) #AUROC=0.9805
+
+# Tuning Parameter $k$------
+K = 11
+
+# Penalized Logistic Regression (ElasticNet)--------
+set.seed(2025)
+
+#model setup
+#generate grid of lambda and alpha values to limit model... took incredibly long and crashed R otherwise
+alpha.lambda = expand.grid(alpha=seq(0, 1, length=10),
+                           lambda= seq(0, 100, length=100))
+
+#generates 1000 models testing alpha and lambda values (10 x 100)
+enet.haiti <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="glmnet",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid = alpha.lambda,
+                    tuneLength = 10
+                    )
+
+#assessing model outcomes
+enet.haiti$bestTune
+
+#applying test set
+enet.test.pred <- predict(enet.haiti, newdata=test)
+enet.test.pred.plot <- plot(enet.test.pred, main="Elastic Net Predictions", las=1)
+
+#creating confusion matrix
+enet.performance <- confusionMatrix(enet.test.pred, test$BlueTarp)
+enet.overall.stats <- enet.performance$overall
+enet.confusion.matrix <- enet.performance$table
+
+#roc setup
+enet.prob <- predict(enet.haiti, newdata=test, type="prob")[,"Hit"]
+enet.roc <- roc(test$BlueTarp, enet.prob, ordered=TRUE)
+enet.roc.plot <- plot(enet.roc, col="red", main="Elastic Net ROC Curve")
+
+#assessing performance
+enet.accuracy <- enet.performance$overall[1] #accuracy = 0.9952564
+enet.tpr <- enet.performance$byClass[1] #TPR aka sensitivity = 0.889441
+enet.fpr <- enet.performance$byClass[2] #FPR aka specificity = 0.9987343
+enet.precision <- enet.performance$byClass[5] #precision = 0.9585007
+enet.auc <- auc(enet.roc) #AUROC = 0.9988
+
+#finding best threshold to maximize accuracy (0.05 found to be best)
+enet.threshold <- thresholder(enet.haiti,
+                             threshold = seq(0, 1, by = 0.05),
+                             final = TRUE)
+
+enet.threshold.plot <- ggplot(enet.threshold, aes(x=prob_threshold, y=Accuracy)) +
+  geom_point()
+
+enet.pred.thres = as.factor(ifelse(predict(enet.haiti,
+                                          newdata=test,
+                                          type="prob")$Hit>0.05, "Hit", "Miss"))
+
+#threshold confusion matrix
+enet.performance.t <- confusionMatrix(test$BlueTarp, enet.pred.thres, positive="Hit")
+enet.overall.stats.t <- enet.performance.t$overall
+enet.confusion.matrix.t <- enet.performance.t$table
+
+#roc setup for threshold
+enet.pred.thres1 <- as.numeric(enet.pred.thres)
+enet.roc.t <- roc(test$BlueTarp, enet.pred.thres1, ordered=TRUE)
+enet.roc.plot.t <- plot(enet.roc.t, col="red", main="Elastic Net ROC Curve using Threshold 0.05")
+
+#assessing performance of threshold=0.4
+enet.accuracy.t <- enet.performance.t$overall[1] #accuracy = 0.9859272
+enet.tpr.t <- enet.performance.t$byClass[1] #TPR aka sensitivity = 0.6992014
+enet.fpr.t <- enet.performance.t$byClass[2] #FPR aka specificity = 0.9992966
+enet.precision.t <- enet.performance.t$byClass[5] #precision = 0.978882
+enet.auc.t <- auc(enet.roc.t) #AUROC=0.9825
+
+# Tuning Parameters for Penalized Logistic Regression------
+Alpha = 1
+Lamba = 0
+
+# Support Vector Machines (SVM)--------
+set.seed(2026)
+
+#trying c=1 through 5
+svm.haiti <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                   tuneGrid=expand.grid(C = seq(1, 5, by=1)))
+
+#assessing model outcomes, best c=1
+svm.haiti$finalModel
+svm.haiti$bestTune
+
+#trying c=5 through 10
+svm.haiti2 <- train(BlueTarp ~ Red + Green + Blue,
+                   data=train, method ="svmLinear",
+                   preProcess = c("center", "scale"),
+                   trControl=train.control,
+                   tuneGrid=expand.grid(C = seq(5, 10, by=1)))
+
+#assessing model outcomes, best c=5
+svm.haiti2$finalModel
+svm.haiti2$bestTune
+
+#trying c=10 through 15
+svm.haiti3 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=expand.grid(C = seq(10, 15, by=1)))
+
+#assessing model outcomes, best c=12
+svm.haiti3$finalModel
+svm.haiti3$bestTune
+
+#trying c=15 through 20
+svm.haiti4 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=expand.grid(C = seq(15, 20, by=1)))
+
+#assessing model outcomes, best c=18
+svm.haiti4$finalModel
+svm.haiti4$bestTune
+
+#trying c=20 through 25
+svm.haiti5 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=expand.grid(C = seq(20, 25, by=1)))
+
+#assessing model outcomes, best c=20
+svm.haiti5$finalModel
+svm.haiti5$bestTune
+
+#trying c=0.1 to 100 based on prior results
+svm.haiti6 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=data.frame(C = c(0.1, 1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 75, 100)))
+
+#assessing model outcomes, best c=0.1
+svm.haiti6$finalModel
+svm.haiti6$bestTune
+
+#trying c=0.1 to 1 based on prior results
+svm.haiti7 <- train(BlueTarp ~ Red + Green + Blue,
+                    data=train, method ="svmLinear",
+                    preProcess = c("center", "scale"),
+                    trControl=train.control,
+                    tuneGrid=data.frame(C = seq(0.1, 1, length=10)))
+
+#assessing model outcomes, best c=0.7
+svm.haiti7$finalModel
+svm.haiti7$bestTune
+cost.selection <- plot(svm.haiti7)
+
+#applying test set
+svm.test.pred <- predict(svm.haiti7, newdata=test)
+svm.test.pred.plot <- plot(svm.test.pred, main="SVM Predictions", las=1)
+
+#creating confusion matrix
+svm.performance <- confusionMatrix(svm.test.pred, test$BlueTarp)
+svm.overall.stats <- svm.performance$overall
+svm.confusion.matrix <- svm.performance$table
+
+#roc setup
+svm.prob <- predict(svm.haiti7, newdata=test, type="prob")[,"Hit"]
+svm.roc <- roc(test$BlueTarp, svm.prob, ordered=TRUE)
+svm.roc.plot <- plot(svm.roc, col="red", main="SVM ROC Curve")
+
+#assessing performance
+svm.accuracy <- svm.performance$overall[1] #accuracy = 0.9955726
+svm.tpr <- svm.performance$byClass[1] #TPR aka sensitivity = 0.8944099
+svm.fpr <- svm.performance$byClass[2] #FPR aka specificity = 0.9988976
+svm.precision <- svm.performance$byClass[5] #precision = 0.9638554
+svm.auc <- auc(svm.roc) #AUROC = 0.998
+
+#finding best threshold to maximize accuracy (0.25 found to be best)
+svm.threshold <- thresholder(svm.haiti7,
+                              threshold = seq(0, 1, by = 0.05),
+                              final = TRUE)
+
+svm.threshold.plot <- ggplot(svm.threshold, aes(x=prob_threshold, y=Accuracy)) +
+  geom_point()
+
+svm.pred.thres = as.factor(ifelse(predict(svm.haiti7,
+                                           newdata=test,
+                                           type="prob")$Hit>0.25, "Hit", "Miss"))
+
+#threshold confusion matrix
+svm.performance.t <- confusionMatrix(test$BlueTarp, svm.pred.thres, positive="Hit")
+svm.overall.stats.t <- svm.performance.t$overall
+svm.confusion.matrix.t <- svm.performance.t$table
+
+#roc setup for threshold
+svm.pred.thres1 <- as.numeric(svm.pred.thres)
+svm.roc.t <- roc(test$BlueTarp, svm.pred.thres1, ordered=TRUE)
+svm.roc.plot.t <- plot(svm.roc.t, col="red", main="SVM ROC Curve using Threshold 0.05")
+
+#assessing performance of threshold=0.4
+svm.accuracy.t <- svm.performance.t$overall[1] #accuracy = 0.9958098
+svm.tpr.t <- svm.performance.t$byClass[1] #TPR aka sensitivity = 0.9440915
+svm.fpr.t <- svm.performance.t$byClass[2] #FPR aka specificity = 0.9974704
+svm.precision.t <- svm.performance.t$byClass[5] #precision = 0.9229814
+svm.auc.t <- auc(svm.roc.t) #AUROC=0.9606
+
+# Performance Table-------
+
+```
+</details>
+
+```{r, echo=FALSE}
+knitr::knit_exit()    # ignore everything after this
+```
+
+
+**ADDITIONAL SECTIONS FOR PART II:**
+
+# Hold-out Data / EDA
+
+Load hold-out data, explore data, etc. 
+
+
+# Results (Hold-Out)
+
+## Cross-Validation Performance Table
+
+**CV Performance Table (for all models) Here**
+
+
+## Hold-out Performance Table
+
+**Hold-Out Performance Table Here**
+
+
+# Final Conclusions
+
+### Conclusion \#1 
+
+### Conclusion \#2
+
+### Conclusion \#3
+
+### Conclusion \#4 
+
+### Conclusion \#5
+
+### Conclusion \#6
+
